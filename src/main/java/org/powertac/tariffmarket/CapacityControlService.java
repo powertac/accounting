@@ -112,7 +112,7 @@ implements CapacityControl, InitializationService
     int tsIndex = event.getTimeslotIndex();
     int current = timeslotRepo.currentTimeslot().getSerialNumber();
     if (tsIndex < current) {
-      log.warn("attempt to save old economic control for ts " + tsIndex +
+      log.warn("attempt to post old economic control for ts " + tsIndex +
                " during timeslot " + current);
       return;
     }
@@ -128,7 +128,7 @@ implements CapacityControl, InitializationService
    * @see org.powertac.common.interfaces.CapacityControl#getCurrentUsage(org.powertac.common.msg.BalancingOrder)
    */
   @Override
-  public double getCurtailableUsage (BalancingOrder order)
+  public double getMaxUpRegulation (BalancingOrder order)
   {
     Tariff tariff = tariffRepo.findTariffById(order.getTariffId());
     if (null == tariff) {
@@ -143,6 +143,13 @@ implements CapacityControl, InitializationService
       result += sub.getMaxRemainingCurtailment();
     }
     return result;
+  }
+
+  @Override
+  public double getMaxDownRegulation (BalancingOrder order)
+  {
+    // TODO Auto-generated method stub
+    return 0;
   }
 
   /**

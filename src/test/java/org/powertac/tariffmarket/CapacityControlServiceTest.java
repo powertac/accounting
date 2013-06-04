@@ -197,7 +197,7 @@ public class CapacityControlServiceTest
     sub2.usePower(300);
     BalancingOrder order = new BalancingOrder(broker, spec, 1.0, 0.1);
     assertEquals("correct curtailable usage", 0.4 * 500.0,
-                 capacityControl.getCurtailableUsage(order), 1e-6);
+                 capacityControl.getMaxUpRegulation(order), 1e-6);
     // exercise the control
     assertEquals("no messages yet", 0, msgs.size());
     reset(mockAccounting);
