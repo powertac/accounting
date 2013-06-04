@@ -21,16 +21,14 @@ import static org.powertac.util.MessageDispatcher.dispatch;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.log4j.Logger;
 import org.joda.time.Instant;
 import org.powertac.common.*;
+import org.powertac.common.TariffTransaction.Type;
 import org.powertac.common.config.ConfigurableValue;
-import org.powertac.common.interfaces.Accounting;
-import org.powertac.common.interfaces.BrokerProxy;
-import org.powertac.common.interfaces.InitializationService;
-import org.powertac.common.interfaces.ServerConfiguration;
-import org.powertac.common.interfaces.TimeslotPhaseProcessor;
+import org.powertac.common.interfaces.*;
 import org.powertac.common.msg.DistributionReport;
 import org.powertac.common.repo.BrokerRepo;
 import org.powertac.common.repo.RandomSeedRepo;
@@ -69,10 +67,15 @@ public class AccountingService
   private RandomSeedRepo randomSeedService;
   
   @Autowired
+  private TransactionFactory txFactory;
+  
+  @Autowired
   private ServerConfiguration serverProps;
 
   private ArrayList<BrokerTransaction> pendingTransactions;
   private DistributionReport distributionReport;
+  private HashMap<Timeslot, ArrayList<MarketTransaction>>
+      pendingMarketTransactions;
 
   // read this from configuration
   
@@ -93,6 +96,8 @@ public class AccountingService
   {
     super();
     pendingTransactions = new ArrayList<BrokerTransaction>();
+    pendingMarketTransactions =
+            new HashMap<Timeslot, ArrayList<MarketTransaction>>();
   }
 
   @Override
@@ -105,6 +110,7 @@ public class AccountingService
   {
     pendingTransactions.clear();
     super.init();
+    bankInterest = null;
     serverProps.configureMe(this);
 
     RandomSeed random =
@@ -120,13 +126,6 @@ public class AccountingService
     serverProps.publishConfiguration(this);
     return "AccountingService";
   }
-  
-  /**
-   * Sets parameters, registers for timeslot phase activation.
-   */
-  public void init(PluginConfig config) 
-  {
-  }
 
   @Override
   public synchronized MarketTransaction 
@@ -135,9 +134,21 @@ public class AccountingService
                        double mWh,
                        double price) 
   {
-    MarketTransaction mtx = new MarketTransaction(broker, timeService.getCurrentTime(),
-                                                  timeslot, mWh, price);
+    MarketTransaction mtx = 
+            txFactory.makeMarketTransaction(broker, timeslot, mWh, price);
+
+    // post pending tx so it gets sent to broker
     pendingTransactions.add(mtx);
+    updateBrokerMarketPosition(mtx);
+
+    // defer posting to delivery timeslot
+    ArrayList<MarketTransaction> theList =
+            pendingMarketTransactions.get(timeslot);
+    if (null == theList) {
+      theList = new ArrayList<MarketTransaction>();
+      pendingMarketTransactions.put(timeslot, theList);
+    }
+    theList.add(mtx);
     return mtx;
   }
 
@@ -150,11 +161,13 @@ public class AccountingService
                        double kWh,
                        double charge) 
   {
-    TariffTransaction ttx = new TariffTransaction(tariff.getBroker(),
-                                                  timeService.getCurrentTime(), txType, 
-                                                  tariffRepo.findSpecificationById(tariff.getSpecId()),
-                                                  customer, customerCount,
-                                                  kWh, charge);
+    TariffTransaction ttx =
+            txFactory.makeTariffTransaction(tariff.getBroker(), txType, 
+                                            tariffRepo.findSpecificationById(tariff.getSpecId()),
+                                            customer, customerCount,
+                                            kWh, charge);
+    if (null == ttx.getTariffSpec())
+      log.error("Null tariff spec in addTariffTx()");
     pendingTransactions.add(ttx);
     return ttx;
   }
@@ -165,9 +178,8 @@ public class AccountingService
                              double kWh,
                              double charge) 
   {
-    DistributionTransaction dtx = new DistributionTransaction(broker, 
-                                                              timeService.getCurrentTime(), 
-                                                              kWh, charge);
+    DistributionTransaction dtx =
+            txFactory.makeDistributionTransaction(broker, kWh, charge);
     pendingTransactions.add(dtx);
     return dtx;
   }
@@ -177,9 +189,7 @@ public class AccountingService
   addBalancingTransaction(Broker broker, double kWh, double charge)
   {
     BalancingTransaction btx =
-        new BalancingTransaction(broker,
-                                 timeService.getCurrentTime(),
-                                 kWh, charge);
+            txFactory.makeBalancingTransaction(broker, kWh, charge);
     pendingTransactions.add(btx);
     return btx;
   }
@@ -198,7 +208,7 @@ public class AccountingService
     for (BrokerTransaction btx : pendingTransactions) {
       if (btx instanceof TariffTransaction) {
         TariffTransaction ttx = (TariffTransaction)btx;
-        if (ttx.getBroker().getUsername() == broker.getUsername()) {
+        if (ttx.getBroker().getUsername().equals(broker.getUsername())) {
           if (ttx.getTxType() == TariffTransaction.Type.CONSUME ||
               ttx.getTxType() == TariffTransaction.Type.PRODUCE) {
             netLoad += ttx.getKWh();
@@ -208,6 +218,35 @@ public class AccountingService
     }
     log.info("net load for " + broker.getUsername() + ": " + netLoad);
     return netLoad;
+  }
+  
+  /**
+   * Returns a mapping of brokers to total supply and demand among subscribed
+   * customers.
+   */
+  @Override
+  public Map<Broker, Map<Type, Double>> getCurrentSupplyDemandByBroker ()
+  {
+    HashMap<Broker, Map<Type, Double>> result =
+            new HashMap<Broker, Map<Type, Double>>();
+    for (BrokerTransaction btx : pendingTransactions) {
+      if (btx instanceof TariffTransaction) {
+        TariffTransaction ttx = (TariffTransaction)btx;
+        Broker broker = ttx.getBroker();
+        Map<Type, Double> record = result.get(broker);
+        if (null == record) {
+          record = new HashMap<Type, Double>();
+          result.put(broker, record);
+          record.put(Type.CONSUME, 0.0);
+          record.put(Type.PRODUCE, 0.0);
+        }
+        if (ttx.getTxType() == Type.CONSUME)
+          record.put(Type.CONSUME, record.get(Type.CONSUME) + ttx.getKWh());
+        else if (ttx.getTxType() == Type.PRODUCE)
+          record.put(Type.PRODUCE, record.get(Type.PRODUCE) + ttx.getKWh());
+      }
+    }
+    return result;
   }
 
   /**
@@ -224,7 +263,7 @@ public class AccountingService
     Timeslot current = timeslotRepo.currentTimeslot();
     log.debug("current timeslot: " + current.getSerialNumber());
     MarketPosition position =
-        broker.findMarketPositionByTimeslot(current);
+        broker.findMarketPositionByTimeslot(current.getSerialNumber());
     if (position == null) {
       log.debug("null position for ts " + current.getSerialNumber());
       return 0.0;
@@ -265,24 +304,25 @@ public class AccountingService
       dispatch(this, "processTransaction", 
                tx, brokerMsg.get(tx.getBroker()));
     }
+    // handle the backed-up mkt transactions for this timeslot
+    handleMarketTransactionsForTimeslot(timeslotRepo.currentTimeslot());
     // for each broker, compute interest and send messages
     double rate = bankInterest / 365.0;
     for (Broker broker : brokerRepo.list()) {
       // run interest payments at midnight
       if (timeService.getHourOfDay() == 0) {
         double brokerRate = rate;
-        CashPosition cash = broker.getCash();
-        if (cash.getBalance() >= 0.0) {
+        double cash = broker.getCashBalance();
+        if (cash >= 0.0) {
           // rate on positive balance is 1/2 of negative
           brokerRate /= 2.0;
         }
-        double interest = cash.getBalance() * brokerRate;
-        brokerMsg.get(broker).add(new BankTransaction(broker, interest,
-                                                      timeService.getCurrentTime()));
-        cash.deposit(interest);
+        double interest = cash * brokerRate;
+        brokerMsg.get(broker).add(txFactory.makeBankTransaction(broker, interest));
+        broker.updateCash(interest);
       }
       // add the cash position to the list and send messages
-      brokerMsg.get(broker).add(broker.getCash());
+      brokerMsg.get(broker).add(txFactory.makeCashPosition(broker, broker.getCashBalance()));
       log.info("Sending " + brokerMsg.get(broker).size() + " messages to " + broker.getUsername());
       brokerProxyService.sendMessages(broker, brokerMsg.get(broker));
     }
@@ -325,22 +365,41 @@ public class AccountingService
                                  ArrayList<Object> messages) {
     updateCash(tx.getBroker(), tx.getCharge());
   }
-
-  // process a market transaction
+  
+  // process market transaction by sending update market position.
+  // actual transaction posting is deferred to delivery time
   public void processTransaction(MarketTransaction tx,
-                                 ArrayList<Object> messages) 
+                                 ArrayList<Object> messages) {
+    MarketPosition mkt =
+        tx.getBroker().findMarketPositionByTimeslot(tx.getTimeslotIndex());
+    if (!messages.contains(mkt))
+      messages.add(mkt);
+  }
+  
+  // process deferred market transactions for the current timeslot
+  public void handleMarketTransactionsForTimeslot(Timeslot ts) 
+  {
+    ArrayList<MarketTransaction> pending = pendingMarketTransactions.get(ts);
+    if (null == pending)
+      return;
+    for (MarketTransaction tx : pending) {
+      Broker broker = tx.getBroker();
+      updateCash(broker, tx.getPrice() * Math.abs(tx.getMWh()));
+    }
+  }
+
+  // pre-process a market transaction
+  public void updateBrokerMarketPosition(MarketTransaction tx) 
   {
     Broker broker = tx.getBroker();
-    updateCash(broker, tx.getPrice() * Math.abs(tx.getMWh()));
     MarketPosition mkt =
-        broker.findMarketPositionByTimeslot(tx.getTimeslot());
+        broker.findMarketPositionByTimeslot(tx.getTimeslotIndex());
     if (mkt == null) {
       mkt = new MarketPosition(broker, tx.getTimeslot(), tx.getMWh());
       log.debug("New MarketPosition(" + broker.getUsername() + 
                 ", " + tx.getTimeslot().getSerialNumber() + "): " + 
                 mkt.getId());
-      broker.addMarketPosition(mkt, tx.getTimeslot());
-      messages.add(mkt);
+      broker.addMarketPosition(mkt, tx.getTimeslotIndex());
     }
     else {
       mkt.updateBalance(tx.getMWh());
@@ -349,8 +408,7 @@ public class AccountingService
 
   private void updateCash(Broker broker, double amount) 
   {
-    CashPosition cash = broker.getCash();
-    cash.deposit(amount);
+    broker.updateCash(amount);
   }
 
   public void processTransaction (BankTransaction tx,

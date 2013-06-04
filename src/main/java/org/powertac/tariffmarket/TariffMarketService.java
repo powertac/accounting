@@ -1,5 +1,5 @@
 /*
- * Copyright 2011-2012 the original author or authors.
+ * Copyright 2011-2013 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,8 @@ package org.powertac.tariffmarket;
 import static org.powertac.util.ListTools.*;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
-
 import org.apache.log4j.Logger;
 import org.joda.time.DateTime;
 import org.joda.time.DateTimeZone;
@@ -29,6 +28,7 @@ import org.powertac.common.Competition;
 import org.powertac.common.CustomerInfo;
 import org.powertac.common.Broker;
 import org.powertac.common.RandomSeed;
+import org.powertac.common.Rate;
 import org.powertac.common.Tariff;
 import org.powertac.common.TariffMessage;
 import org.powertac.common.TariffSpecification;
@@ -52,6 +52,7 @@ import org.powertac.common.msg.TariffRevoke;
 import org.powertac.common.msg.TariffStatus;
 import org.powertac.common.msg.TariffUpdate;
 import org.powertac.common.msg.VariableRateUpdate;
+import org.powertac.common.repo.BrokerRepo;
 import org.powertac.common.repo.RandomSeedRepo;
 import org.powertac.common.repo.TariffRepo;
 import org.powertac.common.repo.TariffSubscriptionRepo;
@@ -86,6 +87,9 @@ public class TariffMarketService
   private BrokerProxy brokerProxyService;
   
   @Autowired
+  private BrokerRepo brokerRepo;
+  
+  @Autowired
   private TimeslotRepo timeslotRepo;
   
   @Autowired
@@ -99,9 +103,6 @@ public class TariffMarketService
 
   @Autowired
   private RandomSeedRepo randomSeedService;
-
-  // maps power type to id of corresponding default tariff
-  private HashMap<PowerType, Long> defaultTariff;
   
   // list of tariffs that have been revoked but not processed
   private ArrayList<Tariff> pendingRevokedTariffs =
@@ -123,15 +124,15 @@ public class TariffMarketService
       publish = true,
       description = "set publication fee directly to override random selection")
   private Double publicationFee = null;
-  
+
   @ConfigurableValue(valueType = "Double",
       description = "low end of tariff revocation fee range")
   private double minRevocationFee = -100.0;
-  
+
   @ConfigurableValue(valueType = "Double",
       description = "high end of tariff revocation fee range")
   private double maxRevocationFee = -500.0;
-  
+
   @ConfigurableValue(valueType = "Double",
       publish = true,
       description = "Set revocation fee directly to override random selection")
@@ -141,7 +142,17 @@ public class TariffMarketService
   private int publicationInterval = 6;
   private int publicationOffset = 0;
   private boolean firstPublication;
-  
+
+  // list of pending subscription events.
+  private List<PendingSubscription> pendingSubscriptionEvents =
+          new ArrayList<PendingSubscription>();
+
+  // list of pending variable-rate updates.
+  private List<VariableRateUpdate> pendingVrus = new ArrayList<VariableRateUpdate>();
+
+  // set of already-disabled brokers
+  private HashSet<Broker> disabledBrokers = new HashSet<Broker>(); 
+
   /**
    * Default constructor
    */
@@ -162,7 +173,6 @@ public class TariffMarketService
       return null;
     }
 
-    defaultTariff = new HashMap<PowerType, Long>();
     //brokerProxyService.registerBrokerMessageListener(this);
     for (Class<?> messageType: Arrays.asList(TariffSpecification.class,
                                              TariffExpire.class,
@@ -179,7 +189,10 @@ public class TariffMarketService
     
     super.init();
     
+    pendingSubscriptionEvents.clear();
     pendingRevokedTariffs.clear();
+    pendingVrus.clear();
+    disabledBrokers.clear();
     revokedTariffs = null;
     lastRevokeProcess = new Instant(0);
 
@@ -294,17 +307,46 @@ public class TariffMarketService
    */
   public void handleMessage (TariffSpecification spec)
   {
-    if (null != tariffRepo.findSpecificationById(spec.getId())) {
+    if (!(null == tariffRepo.findSpecificationById(spec.getId()) ||
+            tariffRepo.isRemoved(spec.getId()))) {
       log.warn("duplicate tariff spec from " + spec.getBroker().getUsername() +
                ", id = " + spec.getId());
       send(new TariffStatus(spec.getBroker(), spec.getId(), spec.getId(),
                             TariffStatus.Status.invalidTariff));
       return;
     }
+    if (null == spec.getRates()) {
+      log.warn("no rates given for spec " + spec.getId());
+      send(new TariffStatus(spec.getBroker(), spec.getId(), spec.getId(),
+                            TariffStatus.Status.invalidTariff));
+      return;
+    }
+    else if (!spec.isValid()) {
+      log.warn("invalid spec " + spec.getId());
+      send(new TariffStatus(spec.getBroker(), spec.getId(), spec.getId(),
+                            TariffStatus.Status.invalidTariff));
+      return;
+    }
+    else {
+      for (Rate rate : spec.getRates()) {
+        if (rate.getDailyBegin() >= 24 || rate.getDailyEnd() >= 24 ||
+                rate.getWeeklyBegin() == 0 || rate.getWeeklyBegin() > 7 ||
+                rate.getWeeklyEnd() == 0 || rate.getWeeklyEnd() > 7) {
+          log.warn("invalid rate for spec " + spec.getId());
+          send(new TariffStatus(spec.getBroker(), spec.getId(), spec.getId(),
+                                TariffStatus.Status.invalidTariff));
+          return;
+        }
+      }
+    }
     tariffRepo.addSpecification(spec);
     Tariff tariff = new Tariff(spec);
-    tariffRepo.addTariff(tariff);
-    tariff.init();
+    if (!tariff.init()) {
+      log.warn("incomplete coverage in multi-rate tariff " + spec.getId());
+      tariffRepo.removeTariff(tariff);
+      send(new TariffStatus(spec.getBroker(), spec.getId(), spec.getId(),
+                            TariffStatus.Status.invalidTariff));
+    }
     log.info("new tariff " + spec.getId());
     accountingService.addTariffTransaction(TariffTransaction.Type.PUBLISH,
                                            tariff, null, 0, 0.0, publicationFee);
@@ -350,12 +392,13 @@ public class TariffMarketService
    */
   public void handleMessage (TariffRevoke update)
   {
+    // basic validation
     ValidationResult result = validateUpdate(update);
-    if (result.tariff == null)
+    if (result.tariff == null) {
       send(result.message);
-    else {
-      addPendingRevoke(result.tariff);
+      return;
     }
+    addPendingRevoke(result.tariff);
     success(update);
   }
 
@@ -365,25 +408,42 @@ public class TariffMarketService
   public void handleMessage (VariableRateUpdate update)
   {
     ValidationResult result = validateUpdate(update);
-    if (result.tariff == null)
+    if (result.tariff == null) {
       send(result.message);
-    else if (result.tariff.addHourlyCharge(update.getHourlyCharge(), update.getRateId())) {
-      success(update);
+      return;
     }
-    else {
-      // failed to add hourly charge
+    Rate rate = tariffRepo.findRateById(update.getRateId());
+    if (rate == null) {
       send(new TariffStatus(update.getBroker(),
                             update.getTariffId(),
                             update.getId(),
                             TariffStatus.Status.invalidUpdate)
-          .withMessage("update: could not add hourly charge"));
+           .withMessage("Non-existent rate in VRU"));
+      return;
     }
+    if (!result.tariff.getTariffSpecification().getRates().contains(rate)) {
+      send(new TariffStatus(update.getBroker(),
+                            update.getTariffId(),
+                            update.getId(),
+                            TariffStatus.Status.invalidUpdate)
+           .withMessage("Rate not associated with tariff in VRU"));
+      return;
+    }
+    if (!update.isValid(rate)) {
+      send(new TariffStatus(update.getBroker(),
+                            update.getTariffId(),
+                            update.getId(),
+                            TariffStatus.Status.invalidUpdate)
+           .withMessage("Invalid charge in VRU"));
+      return;
+    }
+    addVru(update);
   }
   
   /**
    * Processes an incoming ControlEvent from a broker
    */
-  public void handleMessage (EconomicControlEvent msg)
+  public synchronized void handleMessage (EconomicControlEvent msg)
   {
     ValidationResult result = validateUpdate(msg);
     if (result.tariff == null) {
@@ -409,7 +469,7 @@ public class TariffMarketService
   /**
    * Processes an incoming BalancingOrder by storing it in the tariffRepo
    */
-  public void handleMessage (BalancingOrder msg)
+  public synchronized void handleMessage (BalancingOrder msg)
   {
     ValidationResult result = validateUpdate(msg);
     if (result.tariff == null) {
@@ -435,7 +495,7 @@ public class TariffMarketService
       pendingRevokedTariffs.clear();
       return result;
     }
-    return null;
+    return null; // only get non-null result once/timeslot
   }
   
   /**
@@ -444,6 +504,28 @@ public class TariffMarketService
    */
   @Override
   public void processRevokedTariffs ()
+  {
+    // nothing happens -- this is deprecated.
+  }
+
+  private void revokeTariffsForDisabledBrokers ()
+  {
+    for (Broker broker : brokerRepo.findDisabledBrokers()) {
+      if (!disabledBrokers.contains(broker)) {
+        // this is a new one
+        disabledBrokers.add(broker);
+        for (Tariff tariff : tariffRepo.findTariffsByBroker(broker)) {
+          if (Tariff.State.KILLED != tariff.getState()) {
+            log.info("Revoking tariff " + tariff.getId()
+                     + " from disabled broker " + broker.getUsername());
+            addPendingRevoke(tariff);
+          }
+        }
+      }
+    }
+  }
+
+  private void updateRevokedTariffs ()
   {
     List<Tariff> pending = getPendingRevokes();
     if (pending == null)
@@ -507,12 +589,16 @@ public class TariffMarketService
   public void activate (Instant time, int phase)
   {
     log.info("Activate");
-    removeRevokedTariffs();
+    processPendingVrus();
     long msec = timeService.getCurrentTime().getMillis();
     if (!firstPublication ||
         (msec / TimeService.HOUR) % publicationInterval == publicationOffset) {
       // time to publish or never published
+      revokeTariffsForDisabledBrokers();
+      updateRevokedTariffs();
       publishTariffs();
+      //removeRevokedTariffs();
+      processPendingSubscriptions();
       firstPublication = true;
     }
   }
@@ -541,28 +627,6 @@ public class TariffMarketService
     brokerProxyService.broadcastMessages(publishedTariffSpecs);
   }
 
-  /**
-   * Subscribes a block of Customers from a single Customer model to
-   * this Tariff, as long as this Tariff has not expired. If the
-   * subscription succeeds, then the TariffSubscription instance is
-   * return, otherwise null.
-   * <p>
-   * Note that you cannot unsubscribe directly from a Tariff -- you have to do
-   * that from the TariffSubscription that represents the Tariff you want
-   * to unsubscribe from.</p>
-   */
-  @Override
-  public TariffSubscription subscribeToTariff (Tariff tariff,
-                                               CustomerInfo customer,
-                                               int customerCount)
-  {
-    if (tariff.isExpired())
-      return null;
-    TariffSubscription sub = tariffSubscriptionRepo.getSubscription(customer, tariff);
-    sub.subscribe(customerCount);
-    return sub;
-  }
-
   @Override
   public List<Tariff> getActiveTariffList(PowerType type)
   {
@@ -575,21 +639,111 @@ public class TariffMarketService
   @Override
   public Tariff getDefaultTariff (PowerType type)
   {
-    Long defaultId = defaultTariff.get(type);
-    if (defaultId == null)
-      return null;
-    return tariffRepo.findTariffById(defaultId);
+    return tariffRepo.getDefaultTariff(type);
   }
 
   @Override
   public boolean setDefaultTariff (TariffSpecification newSpec)
   {
-    tariffRepo.addSpecification(newSpec);
-    Tariff tariff = new Tariff(newSpec);
-    tariff.init();
-    tariffRepo.addTariff(tariff);
-    defaultTariff.put(newSpec.getPowerType(), tariff.getId());
+    tariffRepo.setDefaultTariff(newSpec);
     return true;
+  }
+  
+  // ----------- Subscribe/unsubscribe processing --------------
+
+  /**
+   * Subscribes a block of Customers from a single Customer model to
+   * this Tariff, as long as this Tariff has not expired. If the
+   * subscription succeeds, then the TariffSubscription instance is
+   * return, otherwise null.
+   * <p>
+   * Note that you cannot unsubscribe directly from a Tariff -- you have to do
+   * that from the TariffSubscription that represents the Tariff you want
+   * to unsubscribe from.</p>
+   */
+  @Override
+  public void subscribeToTariff (Tariff tariff,
+                                 CustomerInfo customer,
+                                 int customerCount)
+  {
+    if (customerCount < 0 || !(tariff.isExpired() || tariff.isRevoked())) {
+      postPendingSubscriptionEvent(tariff, customer, customerCount);
+      List<TariffSubscription> existingSubscriptions =
+              tariffSubscriptionRepo.findSubscriptionsForCustomer(customer);
+      if (0 == existingSubscriptions.size()) {
+        // immediate processing of initial subscriptions
+        processPendingSubscriptions();
+      }
+    }
+    else
+      log.warn("Attempt to subscribe to " +
+               (tariff.isRevoked() ? "revoked" : "expired") +
+               " tariff");
+  }
+  
+  /**
+   * Adds a pending subscribe/unsubscribe for later processing
+   */
+  private synchronized void postPendingSubscriptionEvent (Tariff tariff,
+                                                          CustomerInfo customer,
+                                                          int customerCount)
+  {
+    
+    PendingSubscription event =
+            new PendingSubscription(tariff, customer, customerCount);
+    pendingSubscriptionEvents.add(event);
+  }
+  
+  /**
+   * Handles pending subscription/unsubscription events
+   */
+  private synchronized void processPendingSubscriptions()
+  {
+    for (PendingSubscription pending : pendingSubscriptionEvents) {
+      TariffSubscription sub =
+              tariffSubscriptionRepo.getSubscription(pending.customer,
+                                                     pending.tariff);
+      if (pending.count > 0)
+        sub.subscribe(pending.count);
+      else
+        sub.deferredUnsubscribe(-pending.count);
+    }
+    pendingSubscriptionEvents.clear();
+  }
+  
+  /**
+   * Handles pending vru messages
+   */
+  private void processPendingVrus ()
+  {
+    for (VariableRateUpdate vru: getVruList()) {
+      Tariff tariff = tariffRepo.findTariffById(vru.getTariffId());
+      if (tariff.addHourlyCharge(vru.getHourlyCharge(), vru.getRateId())) {
+        success(vru);
+      }
+      else {
+        // failed to add hourly charge
+        send(new TariffStatus(vru.getBroker(),
+                              vru.getTariffId(),
+                              vru.getId(),
+                              TariffStatus.Status.invalidUpdate)
+          .withMessage("update: could not add hourly charge"));
+      }
+    }
+  }
+  
+  // adds a VariableRateUpdate to the shared list
+  private synchronized void addVru (VariableRateUpdate newVru)
+  {
+    pendingVrus.add(newVru);
+  }
+  
+  // transfers the contents of the pending VRU list to the caller
+  private synchronized List<VariableRateUpdate> getVruList()
+  {
+    ArrayList<VariableRateUpdate> result = new ArrayList<VariableRateUpdate>(pendingVrus);
+    pendingVrus.clear();
+    return result;
   }
   
   // ------------------ Helper stuff ---------------
@@ -628,6 +782,7 @@ public class TariffMarketService
     return new ValidationResult(tariff, null);
   }
 
+  // data structure for message validation result
   private class ValidationResult
   {
     Tariff tariff;
@@ -638,6 +793,22 @@ public class TariffMarketService
       super();
       this.tariff = tariff;
       this.message = msg;
+    }
+  }
+  
+  // data structure for pending subscription events
+  private class PendingSubscription
+  {
+    Tariff tariff;
+    CustomerInfo customer;
+    int count;
+    
+    PendingSubscription (Tariff tariff, CustomerInfo customer, int count)
+    {
+      super();
+      this.tariff = tariff;
+      this.customer = customer;
+      this.count = count;
     }
   }
 
