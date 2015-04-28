@@ -4,6 +4,10 @@
 *.iws
 .idea/
 
+# Eclipse artifacts
+.classpath
+.project
+
 # Deployment directories
 target/
 activemq-data/
@@ -17,6 +21,9 @@ ehthumbs.db
 Icon?
 Thumbs.db
 *.log
+
+# Editor backups
+*~
 
 # Compiled source
 *.class
